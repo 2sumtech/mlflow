@@ -338,6 +338,38 @@ def test_expectation_value_serialization(value):
     assert result.value == expectation.value
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        42,
+        0,
+        -7,
+        # Beyond 2**53, where a double can no longer represent every integer
+        9007199254740993,
+        12345678901234567,
+    ],
+)
+def test_expectation_integer_value_round_trip_preserves_int(value):
+    expectation = ExpectationValue(value)
+
+    result = ExpectationValue.from_proto(expectation.to_proto())
+    assert isinstance(result.value, int)
+    assert result.value == value
+
+    result = ExpectationValue.from_dictionary(expectation.to_dictionary())
+    assert isinstance(result.value, int)
+    assert result.value == value
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_expectation_boolean_value_is_not_serialized(value):
+    expectation = ExpectationValue(value)
+    proto = expectation.to_proto()
+
+    assert not proto.HasField("serialized_value")
+    assert ExpectationValue.from_proto(proto).value is value
+
+
 def test_expectation_invalid_values():
     class CustomObject:
         pass

@@ -672,8 +672,13 @@ class ExpectationValue(_MlflowObject):
             )
 
     def _need_serialization(self):
-        # Values like None, lists, dicts, should be serialized as a JSON string
-        return self.value is not None and not isinstance(self.value, (int, float, bool, str))
+        # Values like None, lists, dicts, should be serialized as a JSON string.
+        # Integers must be serialized as well: `google.protobuf.Value` only stores numbers as a
+        # double, so an int would come back as a float and lose precision above 2**53. `bool` is
+        # a subclass of `int`, but is stored losslessly in `Value.bool_value`.
+        if isinstance(self.value, bool):
+            return False
+        return self.value is not None and not isinstance(self.value, (float, str))
 
 
 @dataclass
