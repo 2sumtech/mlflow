@@ -45,6 +45,7 @@ from mlflow.store.tracking import (
 from mlflow.store.tracking.dbmodels import models
 from mlflow.store.tracking.dbmodels.models import (
     SqlLatestMetric,
+    SqlLoggedModel,
     SqlMetric,
     SqlParam,
     SqlRun,
@@ -4050,6 +4051,132 @@ def test_search_logged_models_invalid_operator_lists_applicable_operators(store:
     exp_id = store.create_experiment(f"exp-{uuid.uuid4()}")
     with pytest.raises(MlflowException, match=re.escape("Expected one of ('<', '<=', '>', '>=',")):
         store.search_logged_models(experiment_ids=[exp_id], filter_string="metrics.loss LIKE 'x'")
+
+
+def _create_logged_models_with_tied_metrics(
+    store: SqlAlchemyStore, exp_id: str, num_models: int, dataset_names: list[str]
+) -> list[str]:
+    """
+    Create ``num_models`` logged models, each scored on every dataset in ``dataset_names`` by a
+    separate run at the same ``timestamp`` and ``step``, so all metric rows of a model are tied.
+    """
+    model_ids = []
+    for i in range(num_models):
+        model = store.create_logged_model(experiment_id=exp_id, name=f"model-{i}")
+        for dataset_name in dataset_names:
+            run = store.create_run(
+                experiment_id=exp_id,
+                user_id="user",
+                start_time=0,
+                run_name=f"run-{i}-{dataset_name}",
+                tags=[],
+            )
+            store.log_metric(
+                run.info.run_id,
+                entities.Metric(
+                    key="accuracy",
+                    value=float(num_models - i),
+                    timestamp=123,
+                    step=0,
+                    model_id=model.model_id,
+                    dataset_name=dataset_name,
+                    dataset_digest="digest",
+                ),
+            )
+        model_ids.append(model.model_id)
+    return model_ids
+
+
+@pytest.mark.parametrize("num_datasets", [1, 2, 3])
+@pytest.mark.parametrize("max_results", [1, 2, 3, 4])
+def test_search_logged_models_order_by_metric_pagination_is_complete(
+    store: SqlAlchemyStore, max_results: int, num_datasets: int
+):
+    exp_id = store.create_experiment(f"exp-{uuid.uuid4()}")
+    dataset_names = [f"dataset-{i}" for i in range(num_datasets)]
+    model_ids = _create_logged_models_with_tied_metrics(store, exp_id, 4, dataset_names)
+    order_by = [{"field_name": "metrics.accuracy", "ascending": False}]
+
+    seen = []
+    token = None
+    while True:
+        page = store.search_logged_models(
+            experiment_ids=[exp_id],
+            max_results=max_results,
+            order_by=order_by,
+            page_token=token,
+        )
+        seen.extend(m.model_id for m in page)
+        token = page.token
+        if token is None:
+            break
+        # A page may only be short when it is the last one
+        assert len(page) == max_results
+
+    assert len(seen) == len(set(seen))
+    assert seen == model_ids
+
+
+def test_search_logged_models_order_by_metric_deduplicates_tied_rows(store: SqlAlchemyStore):
+    exp_id = store.create_experiment(f"exp-{uuid.uuid4()}")
+    model_ids = _create_logged_models_with_tied_metrics(
+        store, exp_id, 4, ["train", "validation", "test"]
+    )
+
+    models = store.search_logged_models(
+        experiment_ids=[exp_id],
+        order_by=[{"field_name": "metrics.accuracy", "ascending": False}],
+    )
+    assert [m.model_id for m in models] == model_ids
+
+
+def test_search_logged_models_order_by_metric_ties_broken_by_model_id(store: SqlAlchemyStore):
+    exp_id = store.create_experiment(f"exp-{uuid.uuid4()}")
+    model_ids = []
+    for i in range(4):
+        model = store.create_logged_model(experiment_id=exp_id, name=f"model-{i}")
+        run = store.create_run(
+            experiment_id=exp_id, user_id="user", start_time=0, run_name=f"run-{i}", tags=[]
+        )
+        store.log_metric(
+            run.info.run_id,
+            entities.Metric(
+                key="accuracy",
+                value=1.0,
+                timestamp=123,
+                step=0,
+                model_id=model.model_id,
+            ),
+        )
+        model_ids.append(model.model_id)
+
+    # Identical metric values and identical creation timestamps: only `model_id` breaks the tie
+    with store.ManagedSessionMaker() as session:
+        session.query(SqlLoggedModel).filter(SqlLoggedModel.model_id.in_(model_ids)).update(
+            {SqlLoggedModel.creation_timestamp_ms: 1000}, synchronize_session=False
+        )
+
+    order_by = [{"field_name": "metrics.accuracy", "ascending": False}]
+    first = [
+        m.model_id for m in store.search_logged_models(experiment_ids=[exp_id], order_by=order_by)
+    ]
+    second = [
+        m.model_id for m in store.search_logged_models(experiment_ids=[exp_id], order_by=order_by)
+    ]
+    assert first == second
+    assert first == sorted(model_ids)
+
+    paged = []
+    token = None
+    while True:
+        page = store.search_logged_models(
+            experiment_ids=[exp_id], max_results=1, order_by=order_by, page_token=token
+        )
+        paged.extend(m.model_id for m in page)
+        token = page.token
+        if token is None:
+            break
+    assert paged == first
 
 
 def test_search_runs_returns_outputs(store: SqlAlchemyStore):

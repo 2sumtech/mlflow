@@ -3528,8 +3528,15 @@ class SqlAlchemyStore(SqlAlchemyMCPServerRegistryMixin, SqlAlchemyGatewayStoreMi
                 .query(
                     SqlLoggedModelMetric.model_id,
                     SqlLoggedModelMetric.metric_value,
+                    # `row_number` (not `rank`) so that metric rows tied on
+                    # (timestamp, step) - e.g. one model scored on several datasets by
+                    # several runs - collapse to exactly one row per model. Otherwise the
+                    # outer join below multiplies the model into N rows, which breaks the
+                    # `LIMIT` applied by `search_logged_models` and silently truncates a
+                    # page. `run_id` is part of the table's primary key, so appending it
+                    # makes the window ordering total and the winning row deterministic.
                     func
-                    .rank()
+                    .row_number()
                     .over(
                         partition_by=[
                             SqlLoggedModelMetric.model_id,
@@ -3538,6 +3545,7 @@ class SqlAlchemyStore(SqlAlchemyMCPServerRegistryMixin, SqlAlchemyGatewayStoreMi
                         order_by=[
                             SqlLoggedModelMetric.metric_timestamp_ms.desc(),
                             SqlLoggedModelMetric.metric_step.desc(),
+                            SqlLoggedModelMetric.run_id.desc(),
                         ],
                     )
                     .label("rank"),
@@ -3560,6 +3568,10 @@ class SqlAlchemyStore(SqlAlchemyMCPServerRegistryMixin, SqlAlchemyGatewayStoreMi
 
         if not has_creation_timestamp:
             order_by_clauses.append(SqlLoggedModel.creation_timestamp_ms.desc())
+
+        # Break remaining ties by model ID so that ordering is total and pagination cannot
+        # return the same model on two pages (`_get_orderby_clauses` does the same for runs)
+        order_by_clauses.append(SqlLoggedModel.model_id.asc())
 
         return models.order_by(*order_by_clauses)
 
