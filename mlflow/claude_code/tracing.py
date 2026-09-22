@@ -27,6 +27,18 @@ from mlflow.telemetry.track import _record_event
 from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey, TraceMetadataKey
 from mlflow.tracing.provider import _get_trace_exporter
 from mlflow.tracing.trace_manager import InMemoryTraceManager
+from mlflow.utils.git_utils import (
+    get_git_branch,
+    get_git_commit,
+    get_git_dirty,
+    get_git_repo_url,
+)
+from mlflow.utils.mlflow_tags import (
+    MLFLOW_GIT_BRANCH,
+    MLFLOW_GIT_COMMIT,
+    MLFLOW_GIT_DIRTY,
+    MLFLOW_GIT_REPO_URL,
+)
 
 # ============================================================================
 # CONSTANTS
@@ -46,6 +58,7 @@ MESSAGE_FIELD_CONTENT = "content"
 MESSAGE_FIELD_TYPE = "type"
 MESSAGE_FIELD_MESSAGE = "message"
 MESSAGE_FIELD_TIMESTAMP = "timestamp"
+MESSAGE_FIELD_CWD = "cwd"
 MESSAGE_FIELD_TOOL_USE_RESULT = "toolUseResult"
 MESSAGE_FIELD_COMMAND_NAME = "commandName"
 MESSAGE_TYPE_QUEUE_OPERATION = "queue-operation"
@@ -502,6 +515,41 @@ def _create_llm_and_tool_spans(
                 tool_span.end(end_time_ns=tool_start_ns + tool_duration_ns)
 
 
+def find_session_working_directory(transcript: list[dict[str, Any]]) -> str:
+    """Find the directory the Claude Code session ran in.
+
+    Claude Code records the session working directory on every transcript entry. Fall back to the
+    hook process' own working directory for transcripts that predate that field.
+    """
+    return next((cwd for entry in transcript if (cwd := entry.get(MESSAGE_FIELD_CWD))), os.getcwd())
+
+
+def resolve_git_metadata(working_directory: str) -> dict[str, str]:
+    """Resolve the git state of the session's repository as trace metadata.
+
+    ``resolve_env_metadata`` already stamps git metadata onto traces, but it resolves it once per
+    process from the process' working directory and caches the result, so it cannot describe the
+    repository a Claude Code session actually ran in and its dirty flag goes stale as the agent
+    edits files. Resolve it per trace instead.
+
+    This is best effort: a session outside a git repository, or one running without GitPython or
+    the ``git`` executable, records no git metadata rather than failing the trace.
+    """
+    try:
+        metadata = {
+            MLFLOW_GIT_COMMIT: get_git_commit(working_directory),
+            MLFLOW_GIT_BRANCH: get_git_branch(working_directory),
+            MLFLOW_GIT_REPO_URL: get_git_repo_url(working_directory),
+        }
+        if (dirty := get_git_dirty(working_directory)) is not None:
+            metadata[MLFLOW_GIT_DIRTY] = str(dirty).lower()
+    except Exception as e:
+        get_logger().debug("Failed to resolve git metadata: %s", e)
+        return {}
+
+    return {key: value for key, value in metadata.items() if value}
+
+
 def _finalize_trace(
     parent_span,
     user_prompt: str,
@@ -510,6 +558,7 @@ def _finalize_trace(
     end_time_ns: int | None = None,
     usage: dict[str, Any] | None = None,
     claude_code_version: str | None = None,
+    git_metadata: dict[str, str] | None = None,
 ) -> mlflow.entities.Trace:
     try:
         # Set trace previews and metadata for UI display
@@ -527,6 +576,10 @@ def _finalize_trace(
                 metadata[TraceMetadataKey.TRACE_SESSION] = session_id
             if claude_code_version:
                 metadata[METADATA_KEY_CLAUDE_CODE_VERSION] = claude_code_version
+            # Overrides the process-wide values resolved by `resolve_env_metadata`, which are
+            # cached and keyed off the hook process' working directory.
+            if git_metadata:
+                metadata.update(git_metadata)
 
             # Set token usage directly on trace metadata so it survives
             # even if span-level aggregation doesn't pick it up
@@ -660,6 +713,7 @@ def process_transcript(
             session_id,
             conv_end_ns,
             claude_code_version=claude_code_version,
+            git_metadata=resolve_git_metadata(find_session_working_directory(transcript)),
         )
 
     except Exception as e:

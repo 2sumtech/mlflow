@@ -95,3 +95,30 @@ def get_git_branch(path: str) -> str | None:
         return repo.active_branch.name
     except Exception:
         return None
+
+
+def get_git_dirty(path: str) -> bool | None:
+    """
+    Obtains whether the git repository associated with the specified path has uncommitted changes
+    to tracked files, returning ``None`` if the path does not correspond to a git repository.
+
+    Untracked files are ignored so that build outputs and scratch files do not mark an otherwise
+    clean checkout as dirty, matching ``mlflow.genai.git_versioning``.
+    """
+    try:
+        from git import Repo
+    except ImportError as e:
+        _logger.warning(
+            "Failed to import Git (the Git executable is probably not on your PATH),"
+            " so Git dirty state is not available. Error: %s",
+            e,
+        )
+        return None
+
+    try:
+        if os.path.isfile(path):
+            path = os.path.dirname(os.path.abspath(path))
+        repo = Repo(path, search_parent_directories=True)
+        return repo.is_dirty(untracked_files=False)
+    except Exception:
+        return None

@@ -1,7 +1,9 @@
 import importlib
 import json
 import logging
+import os
 from pathlib import Path
+from unittest import mock
 
 import pytest
 from claude_agent_sdk.types import (
@@ -27,6 +29,12 @@ from mlflow.claude_code.tracing import (
 )
 from mlflow.entities.span import SpanType
 from mlflow.tracing.constant import SpanAttributeKey, TraceMetadataKey
+from mlflow.utils.mlflow_tags import (
+    MLFLOW_GIT_BRANCH,
+    MLFLOW_GIT_COMMIT,
+    MLFLOW_GIT_DIRTY,
+    MLFLOW_GIT_REPO_URL,
+)
 
 # ============================================================================
 # TIMESTAMP PARSING TESTS
@@ -903,3 +911,101 @@ def test_process_transcript_includes_steer_messages(tmp_path):
     steer_messages = [m for m in input_messages if m.get("content") == "also tell me about Java"]
     assert len(steer_messages) == 1
     assert steer_messages[0]["role"] == "user"
+
+
+# ============================================================================
+# GIT METADATA TESTS
+# ============================================================================
+
+
+def _write_transcript(tmp_path: Path, name: str, cwd: str) -> str:
+    entries = [dict(entry, cwd=cwd) for entry in DUMMY_TRANSCRIPT]
+    transcript_path = tmp_path / name
+    transcript_path.write_text("\n".join(json.dumps(entry) for entry in entries) + "\n")
+    return str(transcript_path)
+
+
+def test_find_session_working_directory_prefers_transcript_cwd():
+    transcript = [{"type": "user"}, {"type": "assistant", "cwd": "/repo/checkout"}]
+
+    assert tracing_module.find_session_working_directory(transcript) == "/repo/checkout"
+
+
+def test_find_session_working_directory_falls_back_to_process_cwd(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    assert tracing_module.find_session_working_directory([{"type": "user"}]) == os.getcwd()
+
+
+def test_process_transcript_records_git_metadata(tmp_path):
+    repo_dir = tmp_path / "checkout"
+    repo_dir.mkdir()
+    transcript_file = _write_transcript(tmp_path, "git_transcript.jsonl", str(repo_dir))
+
+    with (
+        mock.patch(
+            "mlflow.claude_code.tracing.get_git_commit", return_value="a" * 40
+        ) as mock_commit,
+        mock.patch(
+            "mlflow.claude_code.tracing.get_git_branch", return_value="feat/agent"
+        ) as mock_branch,
+        mock.patch(
+            "mlflow.claude_code.tracing.get_git_repo_url",
+            return_value="https://github.com/mlflow/mlflow.git",
+        ) as mock_repo_url,
+        mock.patch("mlflow.claude_code.tracing.get_git_dirty", return_value=True) as mock_dirty,
+    ):
+        trace = process_transcript(transcript_file, "test-git-session")
+
+    assert trace is not None
+    assert trace.info.trace_metadata[MLFLOW_GIT_COMMIT] == "a" * 40
+    assert trace.info.trace_metadata[MLFLOW_GIT_BRANCH] == "feat/agent"
+    assert trace.info.trace_metadata[MLFLOW_GIT_REPO_URL] == "https://github.com/mlflow/mlflow.git"
+    assert trace.info.trace_metadata[MLFLOW_GIT_DIRTY] == "true"
+
+    # Git state is resolved for the directory the session ran in, not the hook process' cwd,
+    # which is what the cached `resolve_env_metadata` would have used.
+    for mock_fn in (mock_commit, mock_branch, mock_repo_url, mock_dirty):
+        mock_fn.assert_called_once_with(str(repo_dir))
+
+
+@pytest.mark.parametrize(("dirty", "expected"), [(True, "true"), (False, "false")])
+def test_resolve_git_metadata_records_dirty_flag(dirty: bool, expected: str):
+    with (
+        mock.patch("mlflow.claude_code.tracing.get_git_commit", return_value="b" * 40),
+        mock.patch("mlflow.claude_code.tracing.get_git_branch", return_value="master"),
+        mock.patch("mlflow.claude_code.tracing.get_git_repo_url", return_value=None),
+        mock.patch("mlflow.claude_code.tracing.get_git_dirty", return_value=dirty) as mock_dirty,
+    ):
+        metadata = tracing_module.resolve_git_metadata("/repo/checkout")
+
+    mock_dirty.assert_called_once_with("/repo/checkout")
+    # A repository without a remote contributes no URL rather than an empty one.
+    assert metadata == {
+        MLFLOW_GIT_COMMIT: "b" * 40,
+        MLFLOW_GIT_BRANCH: "master",
+        MLFLOW_GIT_DIRTY: expected,
+    }
+
+
+def test_resolve_git_metadata_outside_git_repo(tmp_path):
+    # `tmp_path` is not inside a git repository, so every git helper returns None.
+    assert tracing_module.resolve_git_metadata(str(tmp_path)) == {}
+
+
+def test_process_transcript_outside_git_repo_succeeds(tmp_path):
+    transcript_file = _write_transcript(tmp_path, "no_git_transcript.jsonl", str(tmp_path))
+
+    trace = process_transcript(transcript_file, "test-no-git-session")
+
+    assert trace is not None
+    assert trace.info.trace_metadata["mlflow.trace.session"] == "test-no-git-session"
+
+
+def test_resolve_git_metadata_swallows_git_errors(tmp_path):
+    with mock.patch(
+        "mlflow.claude_code.tracing.get_git_commit", side_effect=RuntimeError("git exploded")
+    ) as mock_commit:
+        assert tracing_module.resolve_git_metadata(str(tmp_path)) == {}
+
+    mock_commit.assert_called_once_with(str(tmp_path))

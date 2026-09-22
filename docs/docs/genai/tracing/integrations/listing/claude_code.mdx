@@ -25,6 +25,10 @@ import ImageBox from "@site/src/components/ImageBox";
 - Per-call and per-session token usage and cost
 - Latency and timing for each step
 - Session metadata (working directory, user, model)
+- Git state of the session's repository, for reproducibility: `mlflow.source.git.commit`,
+  `mlflow.source.git.branch`, `mlflow.source.git.repoURL` and `mlflow.source.git.dirty`
+  (`"true"` when the checkout had uncommitted changes to tracked files). Sessions outside a
+  git repository simply record no git metadata.
 
 :::info[Building with the Claude Agent SDK?]
 
