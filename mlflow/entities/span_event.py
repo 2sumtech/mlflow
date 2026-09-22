@@ -11,6 +11,48 @@ from opentelemetry.util.types import AttributeValue
 from mlflow.entities._mlflow_object import _MlflowObject
 from mlflow.tracing.utils.otlp import _set_otel_proto_anyvalue
 
+# Some LLM SDKs raise an exception that carries the partial completion generated before the
+# call was cut short, and the partial output is lost unless we surface it. The canonical case
+# is ``openai.LengthFinishReasonError``, raised when a structured-output request stops with
+# ``finish_reason == "length"``; the tokens already generated are only reachable through the
+# exception's ``completion`` field. Matching on the class name keeps this dependency-free.
+# See https://github.com/mlflow/mlflow/issues/16232
+_PARTIAL_COMPLETION_EXCEPTIONS = frozenset({"LengthFinishReasonError"})
+
+# Cap the stringified completion so the exception message stays readable in the UI.
+MAX_PARTIAL_COMPLETION_LENGTH = 2000
+
+
+def _stringify_partial_completion(exception: BaseException) -> str | None:
+    """
+    Return the partial completion carried by ``exception``, or None if it carries none.
+
+    The result is truncated to ``MAX_PARTIAL_COMPLETION_LENGTH`` characters.
+    """
+    if _PARTIAL_COMPLETION_EXCEPTIONS.isdisjoint(c.__name__ for c in type(exception).__mro__):
+        return None
+
+    completion = getattr(exception, "completion", None)
+    if completion is None:
+        return None
+
+    try:
+        # Pydantic models (the OpenAI SDK's completion objects) serialize to JSON.
+        serialized = (
+            completion.model_dump_json()
+            if hasattr(completion, "model_dump_json")
+            else str(completion)
+        )
+    except Exception:
+        return None
+
+    if len(serialized) > MAX_PARTIAL_COMPLETION_LENGTH:
+        return (
+            f"{serialized[:MAX_PARTIAL_COMPLETION_LENGTH]}... (truncated to "
+            f"{MAX_PARTIAL_COMPLETION_LENGTH} characters)"
+        )
+    return serialized
+
 
 @dataclass
 class SpanEvent(_MlflowObject):
@@ -39,10 +81,15 @@ class SpanEvent(_MlflowObject):
         "Create a span event from an exception."
 
         stack_trace = cls._get_stacktrace(exception)
+        message = str(exception)
+        # OpenTelemetry defines only three attributes for an exception event, so the partial
+        # completion is appended to the message rather than stored as its own attribute.
+        if (partial_completion := _stringify_partial_completion(exception)) is not None:
+            message = f"{message}\nPartial completion: {partial_completion}"
         return cls(
             name="exception",
             attributes={
-                "exception.message": str(exception),
+                "exception.message": message,
                 "exception.type": exception.__class__.__name__,
                 "exception.stacktrace": stack_trace,
             },
